@@ -29,6 +29,13 @@ DB_PATH = os.getenv("NOTIFIER_DB", "/data/notifier.db")
 #   reject            -> do not persist, respond 503 (not accepted)
 VALID_MODES = {"normal", "drop_receipt", "reject"}
 
+# Per-notification lifecycle:
+#   accepted  -> the notification number has been accepted at least once
+#   cancelled -> tombstone: the alarm side closed the round as cancelled; any
+#                late /notify for this number must be refused (HTTP 410)
+STATE_ACCEPTED = "accepted"
+STATE_CANCELLED = "cancelled"
+
 
 class NotifyIn(BaseModel):
     notification_no: str
@@ -55,7 +62,9 @@ class NotifierStore:
                 """
                 CREATE TABLE IF NOT EXISTS notifications (
                     notification_no TEXT PRIMARY KEY,
-                    accepted_at REAL NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'accepted',
+                    accepted_at REAL,
+                    cancelled_at REAL,
                     device TEXT,
                     round_id INTEGER,
                     triggered_at REAL,
@@ -66,6 +75,58 @@ class NotifierStore:
                 )
                 """
             )
+            # Migration for databases created before cancellation tombstones existed.
+            existing_cols = {
+                row["name"] for row in conn.execute("PRAGMA table_info(notifications)")
+            }
+            if "state" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE notifications ADD COLUMN state TEXT NOT NULL DEFAULT 'accepted'"
+                )
+            if "cancelled_at" not in existing_cols:
+                conn.execute("ALTER TABLE notifications ADD COLUMN cancelled_at REAL")
+            if "accepted_at" not in existing_cols:
+                conn.execute("ALTER TABLE notifications ADD COLUMN accepted_at REAL")
+            # Old schemas declared accepted_at NOT NULL, which forbids cancellation
+            # tombstones (they have no acceptance time). Rebuild the table to relax it.
+            col_info = conn.execute("PRAGMA table_info(notifications)").fetchall()
+            accepted_notnull = any(
+                row["name"] == "accepted_at" and row["notnull"] == 1 for row in col_info
+            )
+            if accepted_notnull:
+                conn.execute("ALTER TABLE notifications RENAME TO notifications_legacy")
+                conn.execute(
+                    """
+                    CREATE TABLE notifications (
+                        notification_no TEXT PRIMARY KEY,
+                        state TEXT NOT NULL DEFAULT 'accepted',
+                        accepted_at REAL,
+                        cancelled_at REAL,
+                        device TEXT,
+                        round_id INTEGER,
+                        triggered_at REAL,
+                        recovered_at REAL,
+                        maintenance_id INTEGER,
+                        message TEXT,
+                        deliveries INTEGER NOT NULL DEFAULT 1
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO notifications
+                        (notification_no, state, accepted_at, cancelled_at, device, round_id,
+                         triggered_at, recovered_at, maintenance_id, message, deliveries)
+                    SELECT notification_no,
+                           COALESCE(state, 'accepted'),
+                           accepted_at,
+                           cancelled_at,
+                           device, round_id, triggered_at, recovered_at, maintenance_id,
+                           message, deliveries
+                      FROM notifications_legacy
+                    """
+                )
+                conn.execute("DROP TABLE notifications_legacy")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS settings (
@@ -117,21 +178,29 @@ class NotifierStore:
                 "SELECT * FROM notifications WHERE notification_no = ?",
                 (item.notification_no,),
             ).fetchone()
+            if existing is not None and existing["state"] == STATE_CANCELLED:
+                # A late delivery for an already-cancelled round must never be accepted.
+                return {"accepted": False, "cancelled": True}
             if existing is not None:
                 conn.execute(
                     "UPDATE notifications SET deliveries = deliveries + 1 WHERE notification_no = ?",
                     (item.notification_no,),
                 )
-                return {"accepted": True, "accepted_at": existing["accepted_at"], "duplicate": True}
+                return {
+                    "accepted": True,
+                    "accepted_at": existing["accepted_at"],
+                    "duplicate": True,
+                }
             conn.execute(
                 """
                 INSERT INTO notifications
-                    (notification_no, accepted_at, device, round_id, triggered_at,
+                    (notification_no, state, accepted_at, device, round_id, triggered_at,
                      recovered_at, maintenance_id, message)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.notification_no,
+                    STATE_ACCEPTED,
                     now,
                     item.device,
                     item.round_id,
@@ -142,6 +211,36 @@ class NotifierStore:
                 ),
             )
             return {"accepted": True, "accepted_at": now, "duplicate": False}
+
+    def cancel(self, notification_no: str) -> dict[str, Any]:
+        """Register a cancellation tombstone.
+
+        Idempotent and safe against an in-flight acceptance: if the number was
+        already accepted it keeps its accepted record (the caller reconciles
+        via the returned state); otherwise a tombstone is written so any late
+        notify is refused.
+        """
+        now = time.time()
+        with self._lock, self._db() as conn:
+            existing = conn.execute(
+                "SELECT * FROM notifications WHERE notification_no = ?",
+                (notification_no,),
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "state": existing["state"],
+                    "accepted_at": existing["accepted_at"],
+                    "cancelled_at": existing["cancelled_at"],
+                }
+            conn.execute(
+                """
+                INSERT INTO notifications
+                    (notification_no, state, accepted_at, cancelled_at, deliveries)
+                VALUES (?, ?, NULL, ?, 0)
+                """,
+                (notification_no, STATE_CANCELLED, now),
+            )
+            return {"state": STATE_CANCELLED, "accepted_at": None, "cancelled_at": now}
 
     def lookup(self, notification_no: str) -> dict[str, Any] | None:
         with self._lock, self._db() as conn:
@@ -154,7 +253,7 @@ class NotifierStore:
     def recent(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock, self._db() as conn:
             rows = conn.execute(
-                "SELECT * FROM notifications ORDER BY accepted_at DESC LIMIT ?", (limit,)
+                "SELECT * FROM notifications ORDER BY rowid DESC LIMIT ?", (limit,)
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -189,6 +288,18 @@ def create_app(store: NotifierStore | None = None) -> FastAPI:
         if not item.notification_no.strip():
             return JSONResponse(status_code=422, content={"accepted": False})
         result = store.accept(item)
+        if result.get("cancelled"):
+            # Cancellation tombstone wins regardless of the current fault mode:
+            # a late delivery of a closed round can never be accepted.
+            logger.info("refuse late notify %s (cancelled tombstone)", item.notification_no)
+            return JSONResponse(
+                status_code=410,
+                content={
+                    "accepted": False,
+                    "cancelled": True,
+                    "detail": "该通知号对应轮次已取消，迟到的通知不再受理",
+                },
+            )
         if mode == "drop_receipt":
             logger.info("accepted %s then dropping receipt (fault mode)", item.notification_no)
             return JSONResponse(
@@ -198,6 +309,16 @@ def create_app(store: NotifierStore | None = None) -> FastAPI:
         logger.info("accepted %s", item.notification_no)
         return JSONResponse(status_code=200, content=result)
 
+    @app.post("/notifications/{notification_no}/cancel")
+    def cancel_notification(notification_no: str, request: Request) -> JSONResponse:
+        store: NotifierStore = request.app.state.store
+        result = store.cancel(notification_no)
+        if result["state"] == STATE_ACCEPTED:
+            # An in-flight acceptance landed first: the round must be reconciled
+            # as sent instead of cancelled. The accepted record is untouched.
+            return JSONResponse(status_code=409, content=result)
+        return JSONResponse(status_code=200, content=result)
+
     @app.get("/notifications/{notification_no}")
     def lookup(notification_no: str, request: Request) -> JSONResponse:
         row = request.app.state.store.lookup(notification_no)
@@ -205,6 +326,16 @@ def create_app(store: NotifierStore | None = None) -> FastAPI:
             return JSONResponse(
                 status_code=404,
                 content={"accepted": False, "detail": "通知端没有该通知号"},
+            )
+        if row["state"] == STATE_CANCELLED:
+            return JSONResponse(
+                status_code=410,
+                content={
+                    "accepted": False,
+                    "cancelled": True,
+                    "notification_no": row["notification_no"],
+                    "cancelled_at": row["cancelled_at"],
+                },
             )
         return JSONResponse(
             status_code=200,

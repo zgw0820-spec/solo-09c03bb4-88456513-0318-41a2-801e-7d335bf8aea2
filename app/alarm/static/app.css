@@ -131,7 +131,7 @@ input[type="datetime-local"] {
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   gap: 12px;
 }
 .stat {
@@ -148,6 +148,7 @@ input[type="datetime-local"] {
 .stat .t { font-size: 12px; color: var(--muted); }
 .stat.suppressed { border-left-color: var(--amber); }
 .stat.pending { border-left-color: var(--blue); }
+.stat.verifying { border-left-color: var(--red); }
 .stat.sent { border-left-color: var(--green); }
 .stat.skipped { border-left-color: var(--slate); }
 .stat.cancelled { border-left-color: var(--violet); }
@@ -165,6 +166,7 @@ td.note { color: var(--muted); max-width: 320px; }
 .tag { font-size: 12px; padding: 2px 8px; border-radius: 6px; white-space: nowrap; display: inline-block; }
 .tag.suppressed { background: #fdf3e0; color: var(--amber); }
 .tag.pending { background: #e6efff; color: var(--blue); }
+.tag.verifying { background: #fbe3e3; color: var(--red); }
 .tag.sent { background: #e2f3ea; color: var(--green); }
 .tag.skipped { background: #eef1f5; color: var(--slate); }
 .tag.cancelled { background: #efeafa; color: var(--violet); }
@@ -183,6 +185,8 @@ td.note { color: var(--muted); max-width: 320px; }
   background: #fbfcfe;
 }
 .notifier-list .nrow span:first-child { font-family: "JetBrains Mono", monospace; color: var(--blue); }
+.notifier-list .nrow.tombstone { border-style: solid; border-color: #e0d3f3; background: #f6f1fd; }
+.notifier-list .nrow.tombstone span:first-child { color: var(--violet); text-decoration: line-through; }
 
 .toast {
   position: fixed;

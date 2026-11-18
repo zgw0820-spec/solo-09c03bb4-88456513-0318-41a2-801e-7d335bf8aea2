@@ -108,7 +108,7 @@ function render(state) {
   $("#set-maint").disabled = busy;
 
   const c = state.counts;
-  const values = [c.suppressed, c.pending, c.sent, c.skipped, c.cancelled];
+  const values = [c.suppressed, c.pending, c.verifying, c.sent, c.skipped, c.cancelled];
   document.querySelectorAll("#stats .stat .n").forEach((el, idx) => {
     el.textContent = values[idx];
   });
@@ -121,11 +121,13 @@ function render(state) {
       ? `已受理 ${fmtTime(r.accepted_at)}`
       : r.state === "delivering"
         ? "投递中…"
-        : r.needs_verify
-          ? "待按通知号核实"
-          : r.state === "pending"
-            ? "等待投递"
-            : "—";
+        : r.state === "verifying"
+          ? "待核实（按通知号核查中）"
+          : r.needs_verify
+            ? "待按通知号核实"
+            : r.state === "pending"
+              ? "等待投递"
+              : "—";
     const cells = [
       `<b>#${r.id}</b>`,
       `<span class="mono">${r.notification_no}</span>`,
@@ -175,12 +177,20 @@ async function refreshNotifier() {
       return;
     }
     list.innerHTML = data.items
-      .map(
-        (n) =>
+      .map((n) => {
+        if (n.state === "cancelled") {
+          return (
+            `<div class="nrow tombstone"><span>${n.notification_no}</span>` +
+            `<span>${fmt(n.cancelled_at)}</span>` +
+            `<span>已取消登记 · 迟到通知不再受理 · 模式 ${data.mode}</span></div>`
+          );
+        }
+        return (
           `<div class="nrow"><span>${n.notification_no}</span>` +
           `<span>${fmt(n.accepted_at)}</span>` +
           `<span>${n.message || ""} · 交付次数 ${n.deliveries} · 模式 ${data.mode}</span></div>`
-      )
+        );
+      })
       .join("");
   } catch (err) {
     $("#notifier-list").innerHTML = `<div class="muted">通知端不可达：${err.message}</div>`;

@@ -166,7 +166,8 @@ def test_lost_receipt_with_unverifiable_state_stays_pending(alarm, notifier, mon
     created = alarm.trigger()
     alarm.tick()
     row = round_by_id(alarm.get_state(), created["id"])
-    assert row["state"] == "pending"
+    assert row["state"] == "verifying"
+    assert row["state_label"] == "待核实"
     assert row["needs_verify"] is True
     assert row["accepted_at"] is None
     assert notifier_rows(store) == []
@@ -194,8 +195,9 @@ def test_restart_resumes_by_verifying_before_resending(alarm_factory, notifier, 
     store.set_mode("normal")
     restarted = alarm_factory()
     row = round_by_id(restarted.get_state(), created["id"])
-    assert row["state"] == "pending"
+    assert row["state"] == "verifying"
     assert row["needs_verify"] is True
+    assert row["state_label"] == "待核实"
 
     restarted.tick()
     row = round_by_id(restarted.get_state(), created["id"])
@@ -230,7 +232,7 @@ def test_recovered_after_delivery_started_is_kept_and_not_duplicated(alarm, noti
     db.close()
 
     recovered = alarm.recover()
-    assert recovered["state"] == "pending"
+    assert recovered["state"] == "verifying"
     assert recovered["needs_verify"] is True
     assert "投递已开始" in recovered["note"]
 
@@ -248,19 +250,130 @@ def test_recovered_after_delivery_started_is_kept_and_not_duplicated(alarm, noti
     assert rows[0]["deliveries"] == 1
 
 
-def test_recovery_after_failed_send_stops_retrying(alarm, notifier, clock):
+def test_recovered_after_delivery_started_late_accept_is_kept(alarm, notifier, clock):
+    """The exact reported race: timeout + 404 on recovery, then late acceptance."""
+    store, _ = notifier
+    created = alarm.trigger()
+    number = created["notification_no"]
+    db = sqlite3.connect(alarm.db_path)
+    db.execute(
+        "UPDATE alarm_rounds SET state='delivering', delivery_started_at=? WHERE id=?",
+        (clock(), created["id"]),
+    )
+    db.commit()
+    db.close()
+
+    # Recovery while the request fate is unknown: the page must show 待核实, not 已取消.
+    recovered = alarm.recover()
+    assert recovered["state"] == "verifying"
+    assert recovered["state_label"] == "待核实"
+
+    # First reconcile finds nothing at the notifier yet, so the number is tombstoned.
+    alarm.tick()
+    row = round_by_id(alarm.get_state(), created["id"])
+    assert row["state"] == "cancelled"
+    tombstone = store.lookup(number)
+    assert tombstone is not None and tombstone["state"] == "cancelled"
+
+    # The original request is handled late: the notifier must refuse it (410).
+    from app.notifier.main import NotifyIn
+    late = store.accept(NotifyIn(notification_no=number, round_id=created["id"]))
+    assert late == {"accepted": False, "cancelled": True}
+    assert store.lookup(number)["state"] == "cancelled"
+    # A worker tick must not resurrect or re-notify the closed round.
+    clock.advance(60)
+    alarm.tick()
+    assert round_by_id(alarm.get_state(), created["id"])["state"] == "cancelled"
+    assert [r for r in notifier_rows(store) if r["state"] == "accepted"] == []
+
+
+def test_recovered_after_delivery_started_acceptance_wins_over_cancel(alarm, notifier, clock):
+    """If the in-flight request is accepted while we reconcile, the record is kept."""
+    store, _ = notifier
+    created = alarm.trigger()
+    number = created["notification_no"]
+    db = sqlite3.connect(alarm.db_path)
+    db.execute(
+        "UPDATE alarm_rounds SET state='delivering', delivery_started_at=? WHERE id=?",
+        (clock(), created["id"]),
+    )
+    db.commit()
+    db.close()
+
+    recovered = alarm.recover()
+    assert recovered["state"] == "verifying"
+
+    # Late acceptance lands before the tombstone is registered.
+    from app.notifier.main import NotifyIn
+    store.accept(NotifyIn(notification_no=number, round_id=created["id"]))
+    alarm.tick()
+    row = round_by_id(alarm.get_state(), created["id"])
+    assert row["state"] == "sent"
+    assert row["accepted_at"] is not None
+    rows = notifier_rows(store)
+    assert len(rows) == 1 and rows[0]["state"] == "accepted"
+    # A later cancel call must not overwrite the accepted record.
+    again = store.cancel(number)
+    assert again["state"] == "accepted"
+    assert store.lookup(number)["state"] == "accepted"
+
+
+def test_recovery_after_definitive_reject_without_delivery_is_cancelled(alarm, notifier, clock):
+    """A 503 rejection means no request is in flight: nothing can be accepted late."""
     store, _ = notifier
     store.set_mode("reject")
     created = alarm.trigger()
+    number = created["notification_no"]
     alarm.tick()
-    assert round_by_id(alarm.get_state(), created["id"])["state"] == "pending"
+    row = round_by_id(alarm.get_state(), created["id"])
+    assert row["state"] == "pending"
+    assert row["needs_verify"] is False
 
     recovered = alarm.recover()
     assert recovered["state"] == "cancelled"
     clock.advance(60)
     alarm.tick()
-    assert notifier_rows(store) == []
     assert round_by_id(alarm.get_state(), created["id"])["state"] == "cancelled"
+    assert store.lookup(number) is None  # never accepted, no tombstone needed
+    assert notifier_rows(store) == []
+
+
+def test_recovered_verifying_round_unknown_fate_tombstones_then_cancels(alarm, notifier, clock):
+    """Timeout-style unknown fate: recovery -> 待核实 -> verify+cancel handshake."""
+    store, _ = notifier
+    from app.alarm.service import NotifyOutcome
+
+    created = alarm.trigger()
+    number = created["notification_no"]
+    # Simulate a timed-out first delivery: result unknown, verify also unknown.
+    alarm._client.notify = lambda payload: NotifyOutcome("unknown", detail="超时")
+    alarm._client.verify = lambda no: NotifyOutcome("unknown", detail="核实超时")
+    alarm.tick()
+    assert round_by_id(alarm.get_state(), created["id"])["state"] == "verifying"
+
+    recovered = alarm.recover()
+    assert recovered["state"] == "verifying"
+    assert recovered["state_label"] == "待核实"
+
+    # Notifier still unreachable: the round must remain 待核实 (never cancelled/sent).
+    clock.advance(60)
+    alarm.tick()
+    assert round_by_id(alarm.get_state(), created["id"])["state"] == "verifying"
+    assert store.lookup(number) is None
+
+    # Notifier back, with no record: tombstone then cancel.
+    del alarm._client.notify
+    del alarm._client.verify
+    clock.advance(60)  # pass the bounded backoff window
+    alarm.tick()
+    row = round_by_id(alarm.get_state(), created["id"])
+    assert row["state"] == "cancelled"
+    assert store.lookup(number)["state"] == "cancelled"
+
+    # A late copy of the original request is now refused at the notifier.
+    from app.notifier.main import NotifyIn
+    late = store.accept(NotifyIn(notification_no=number, round_id=created["id"]))
+    assert late == {"accepted": False, "cancelled": True}
 
 
 def test_trigger_and_recover_conflicts(alarm):
@@ -316,7 +429,7 @@ def test_notifier_down_never_reported_sent_and_recovery_clears_it(alarm, notifie
 
     alarm.tick()
     row = round_by_id(alarm.get_state(), created["id"])
-    assert row["state"] == "pending"
+    assert row["state"] == "verifying"
     assert row["needs_verify"] is True
     assert row["accepted_at"] is None
     assert row["last_error"] is not None
@@ -324,21 +437,172 @@ def test_notifier_down_never_reported_sent_and_recovery_clears_it(alarm, notifie
     clock.advance(2)
     alarm.tick()
     row = round_by_id(alarm.get_state(), created["id"])
-    assert row["state"] == "pending"
+    assert row["state"] == "verifying"
     assert row["accepted_at"] is None
 
     # Alert clears while the notifier is unreachable: reconcile by number, never guess.
     recovered = alarm.recover()
-    assert recovered["needs_verify"] is True
+    assert recovered["state"] == "verifying"
+    assert recovered["state_label"] == "待核实"
     assert recovered["accepted_at"] is None
 
-    # Notifier comes back without this number: round is cancelled, nothing delivered.
+    # Still unreachable: it must keep showing 待核实 instead of 已取消.
+    clock.advance(60)
+    alarm.tick()
+    assert round_by_id(alarm.get_state(), created["id"])["state"] == "verifying"
+
+    # Notifier comes back without this number: tombstone is registered, then cancelled.
     alarm._client.base_url = str(notifier[1])
+    clock.advance(60)  # pass the bounded backoff window
+    alarm.tick()
+    row = round_by_id(alarm.get_state(), created["id"])
+    assert row["state"] == "cancelled"
+    assert notifier_rows(store) and notifier_rows(store)[0]["state"] == "cancelled"
+    assert [r for r in notifier_rows(store) if r["state"] == "accepted"] == []
+
+
+def test_restart_during_unreachable_notifier_keeps_verifying(alarm_factory, notifier, clock):
+    """Both sides may restart: an unreachable notifier must never yield a verdict."""
+    store, url = notifier
+    service = alarm_factory()
+    created = service.trigger()
+    service._client.base_url = "http://127.0.0.1:1"
+    service.tick()
+    assert round_by_id(service.get_state(), created["id"])["state"] == "verifying"
+    service.recover()
+    service.close()
+
+    # Restart the alarm service while the notifier is still unreachable.
+    restarted = alarm_factory()
+    restarted._client.base_url = "http://127.0.0.1:1"
+    row = round_by_id(restarted.get_state(), created["id"])
+    assert row["state"] == "verifying"
+    assert row["accepted_at"] is None
+
+    clock.advance(60)
+    restarted.tick()
+    assert round_by_id(restarted.get_state(), created["id"])["state"] == "verifying"
+    assert store.lookup(created["notification_no"]) is None
+
+    # Notifier restored with no record: tombstone + cancel, still no acceptance.
+    restarted._client.base_url = url
+    clock.advance(60)  # pass the bounded backoff window
+    restarted.tick()
+    row = round_by_id(restarted.get_state(), created["id"])
+    assert row["state"] == "cancelled"
+    assert store.lookup(created["notification_no"])["state"] == "cancelled"
+
+
+def test_restart_reconciles_late_acceptance_as_sent(alarm_factory, notifier, clock):
+    """Late acceptance before the restarted reconcile keeps the delivery record."""
+    store, _ = notifier
+    service = alarm_factory()
+    created = service.trigger()
+    number = created["notification_no"]
+    db = sqlite3.connect(service.db_path)
+    db.execute(
+        "UPDATE alarm_rounds SET state='delivering', delivery_started_at=?, "
+        "recovered_at=? WHERE id=?",
+        (clock(), clock(), created["id"]),
+    )
+    db.commit()
+    db.close()
+    service.close()
+
+    # The notifier accepts the in-flight request while the alarm service is down.
+    from app.notifier.main import NotifyIn
+    store.accept(NotifyIn(notification_no=number, round_id=created["id"]))
+
+    restarted = alarm_factory()
+    row = round_by_id(restarted.get_state(), created["id"])
+    assert row["state"] == "verifying"
+    restarted.tick()
+    row = round_by_id(restarted.get_state(), created["id"])
+    assert row["state"] == "sent"
+    assert row["accepted_at"] is not None
+    rows = notifier_rows(store)
+    assert len(rows) == 1 and rows[0]["deliveries"] == 1
+
+
+def test_repeated_verify_never_splits_verdict(alarm, notifier, clock):
+    """Repeated reconcile ticks cannot mark one round both cancelled and accepted."""
+    store, _ = notifier
+    created = alarm.trigger()
+    number = created["notification_no"]
+    db = sqlite3.connect(alarm.db_path)
+    db.execute(
+        "UPDATE alarm_rounds SET state='delivering', delivery_started_at=? WHERE id=?",
+        (clock(), created["id"]),
+    )
+    db.commit()
+    db.close()
+
+    assert alarm.recover()["state"] == "verifying"
+    for _ in range(4):
+        clock.advance(60)
+        alarm.tick()
+    row = round_by_id(alarm.get_state(), created["id"])
+    assert row["state"] == "cancelled"
+    assert row["accepted_at"] is None
+    assert store.lookup(number)["state"] == "cancelled"
+    # Even a delayed copy of the original request cannot create an accepted record.
+    from app.notifier.main import NotifyIn
+    late = store.accept(NotifyIn(notification_no=number, round_id=created["id"]))
+    assert late["cancelled"] is True
+    assert store.lookup(number)["state"] == "cancelled"
+
+
+def test_active_alert_still_delivered_once_after_verify_404(alarm, notifier, clock):
+    """Active rounds with a transient 404 still get delivered, same number, once."""
+    store, _ = notifier
+    created = alarm.trigger()
+    number = created["notification_no"]
+    from app.alarm.service import NotifyOutcome
+
+    calls = {"n": 0}
+
+    def flaky_notify(payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return NotifyOutcome("unknown", detail="超时")
+        # Fall back to the real client afterwards.
+        return type(alarm._client).notify(alarm._client, payload)
+
+    alarm._client.notify = flaky_notify
+    alarm.tick()  # unknown -> verify 404 while active -> fresh notify same tick
+    row = round_by_id(alarm.get_state(), created["id"])
+    assert row["state"] == "sent"
+    rows = notifier_rows(store)
+    assert len(rows) == 1
+    assert rows[0]["notification_no"] == number
+    assert rows[0]["deliveries"] == 1
+
+    # A later tick never re-notifies the same number.
+    clock.advance(60)
+    alarm.tick()
+    assert notifier_rows(store)[0]["deliveries"] == 1
+
+
+def test_active_alert_verifying_then_recover_and_cancel(alarm, notifier, clock):
+    """If the active round is recovered before the next verify, it closes cleanly."""
+    store, _ = notifier
+    created = alarm.trigger()
+    number = created["notification_no"]
+    from app.alarm.service import NotifyOutcome
+
+    alarm._client.notify = lambda payload: NotifyOutcome("unknown", detail="超时")
+    alarm._client.verify = lambda no: NotifyOutcome("unknown", detail="核实超时")
+    alarm.tick()
+    assert round_by_id(alarm.get_state(), created["id"])["state"] == "verifying"
+
+    assert alarm.recover()["state"] == "verifying"
+    del alarm._client.notify
+    del alarm._client.verify
     clock.advance(60)
     alarm.tick()
     row = round_by_id(alarm.get_state(), created["id"])
     assert row["state"] == "cancelled"
-    assert notifier_rows(store) == []
+    assert store.lookup(number)["state"] == "cancelled"
 
 
 def test_cutoff_passed_during_downtime_is_released_on_restart(alarm_factory, notifier, clock):

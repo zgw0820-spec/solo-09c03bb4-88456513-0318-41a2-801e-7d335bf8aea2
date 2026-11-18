@@ -140,3 +140,53 @@ def test_notifier_fault_modes_and_lookup(tmp_path, notifier):
 
         bad = http.post("/api/fault", json={"mode": "nonsense"})
         assert bad.status_code == 400
+
+
+def test_notifier_cancel_tombstone_refuses_late_notify(tmp_path, notifier):
+    _store, url = notifier
+    with httpx.Client(base_url=url, timeout=5) as http:
+        number = "ALM-800001"
+        # First cancellation registers a tombstone, idempotent on repeat.
+        first = http.post(f"/notifications/{number}/cancel")
+        assert first.status_code == 200
+        assert first.json()["state"] == "cancelled"
+        second = http.post(f"/notifications/{number}/cancel")
+        assert second.status_code == 200
+
+        # Lookup reports 410; a late notify is refused with 410 even in normal mode.
+        assert http.get(f"/notifications/{number}").status_code == 410
+        late = http.post("/notify", json={"notification_no": number})
+        assert late.status_code == 410
+        assert late.json()["cancelled"] is True
+
+        # The tombstone also wins over the fault-injection modes.
+        http.post("/api/fault", json={"mode": "drop_receipt"})
+        assert http.post("/notify", json={"notification_no": number}).status_code == 410
+
+
+def test_notifier_cancel_after_acceptance_keeps_accepted_record(tmp_path, notifier):
+    _store, url = notifier
+    with httpx.Client(base_url=url, timeout=5) as http:
+        number = "ALM-800002"
+        http.post("/notify", json={"notification_no": number})
+        # A cancel arriving after acceptance must not overwrite the record.
+        resp = http.post(f"/notifications/{number}/cancel")
+        assert resp.status_code == 409
+        assert resp.json()["state"] == "accepted"
+        lookup = http.get(f"/notifications/{number}")
+        assert lookup.status_code == 200
+        assert lookup.json()["accepted"] is True
+
+
+def test_api_state_exposes_verifying_group(tmp_path, notifier):
+    client, service = make_client(tmp_path, notifier)
+    with client:
+        created = client.post("/api/alarm/trigger").json()
+        service._client.base_url = "http://127.0.0.1:1"
+        client.post("/api/tick")
+        state = client.get("/api/state").json()
+        row = next(r for r in state["rounds"] if r["id"] == created["id"])
+        assert row["state"] == "verifying"
+        assert row["state_label"] == "待核实"
+        assert state["counts"]["verifying"] == 1
+    service.close()

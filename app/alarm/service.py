@@ -18,6 +18,7 @@ STATE_LABELS = {
     "suppressed": "抑制中",
     "pending": "待送",
     "delivering": "待送（投递中）",
+    "verifying": "待核实",
     "sent": "已送",
     "skipped": "未补送",
     "cancelled": "已取消",
@@ -27,6 +28,7 @@ GROUP_OF_STATE = {
     "suppressed": "suppressed",
     "pending": "pending",
     "delivering": "pending",
+    "verifying": "verifying",
     "sent": "sent",
     "skipped": "skipped",
     "cancelled": "cancelled",
@@ -49,7 +51,7 @@ class NotifyOutcome:
         detail: str = "",
         duplicate: bool = False,
     ) -> None:
-        # kind: accepted | not_found | unknown
+        # kind: accepted | not_found | cancelled | unknown
         self.kind = kind
         self.accepted_at = accepted_at
         self.detail = detail
@@ -90,6 +92,13 @@ class NotifierClient:
                     duplicate=bool(data.get("duplicate")),
                 )
             return NotifyOutcome("unknown", detail="通知端未确认受理")
+        if resp.status_code == 410:
+            # The notifier holds a cancellation tombstone for this number.
+            return NotifyOutcome("cancelled", detail="通知端已登记该通知号取消，拒绝迟到通知")
+        if resp.status_code == 503:
+            # Definitive application-level rejection: nothing was persisted, so no
+            # in-flight request for this number can be accepted later.
+            return NotifyOutcome("not_found", detail="通知端明确拒绝受理（HTTP 503）")
         return NotifyOutcome("unknown", detail=f"通知端 HTTP {resp.status_code}")
 
     def verify(self, notification_no: str) -> NotifyOutcome:
@@ -102,6 +111,8 @@ class NotifierClient:
             return NotifyOutcome("unknown", detail=f"按通知号核实失败（{type(exc).__name__}）")
         if resp.status_code == 404:
             return NotifyOutcome("not_found", detail="通知端无此通知号")
+        if resp.status_code == 410:
+            return NotifyOutcome("cancelled", detail="通知端登记该通知号已取消")
         if resp.status_code == 200:
             try:
                 data = resp.json()
@@ -117,6 +128,32 @@ class NotifierClient:
                 )
             return NotifyOutcome("not_found", detail="通知端记录未受理")
         return NotifyOutcome("unknown", detail=f"核实请求 HTTP {resp.status_code}")
+
+    def cancel(self, notification_no: str) -> NotifyOutcome:
+        """Ask the notifier to tombstone the number so late notifies are refused."""
+        try:
+            resp = httpx.post(
+                f"{self.base_url}/notifications/{notification_no}/cancel",
+                timeout=self._timeout(),
+            )
+        except httpx.HTTPError as exc:
+            return NotifyOutcome("unknown", detail=f"取消登记失败（{type(exc).__name__}）")
+        if 200 <= resp.status_code < 300:
+            return NotifyOutcome("cancelled", detail="通知端已登记取消")
+        if resp.status_code == 409:
+            try:
+                data = resp.json()
+            except ValueError:
+                return NotifyOutcome("unknown", detail="取消登记响应无法解析")
+            accepted_at = data.get("accepted_at")
+            if not isinstance(accepted_at, (int, float)):
+                accepted_at = None
+            return NotifyOutcome(
+                "accepted",
+                accepted_at=float(accepted_at) if accepted_at is not None else None,
+                detail="取消登记前通知已被受理",
+            )
+        return NotifyOutcome("unknown", detail=f"取消登记请求 HTTP {resp.status_code}")
 
 
 class AlarmService:
@@ -231,10 +268,10 @@ class AlarmService:
             changed = conn.execute(
                 """
                 UPDATE alarm_rounds
-                   SET state = 'pending',
+                   SET state = 'verifying',
                        needs_verify = 1,
                        next_attempt_at = ?,
-                       note = '服务重启时投递结果未确认，先按通知号核实',
+                       note = '服务重启时投递结果未确认，先按通知号核实；核实前不判取消也不重发',
                        updated_at = ?
                  WHERE state = 'delivering'
                 """,
@@ -320,7 +357,7 @@ class AlarmService:
             row = conn.execute(
                 """
                 SELECT * FROM alarm_rounds
-                 WHERE state = 'pending'
+                 WHERE state IN ('pending', 'verifying')
                    AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
                  ORDER BY id ASC
                  LIMIT 1
@@ -334,7 +371,7 @@ class AlarmService:
                 UPDATE alarm_rounds
                    SET state = 'delivering',
                        updated_at = ?
-                 WHERE id = ? AND state = 'pending'
+                 WHERE id = ? AND state IN ('pending', 'verifying')
                 """,
                 (now, row["id"]),
             ).rowcount
@@ -389,9 +426,33 @@ class AlarmService:
                        next_attempt_at = NULL,
                        note = ?,
                        updated_at = ?
-                 WHERE id = ? AND state IN ('pending', 'delivering')
+                 WHERE id = ? AND state IN ('pending', 'delivering', 'verifying')
                 """,
                 (note, now, round_id),
+            )
+
+    def _set_verifying(self, round_id: int, error: str, note: str) -> None:
+        """Park a round in 待核实 with bounded backoff; never a terminal verdict."""
+        now = self._clock()
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT attempts FROM alarm_rounds WHERE id = ?", (round_id,)
+            ).fetchone()
+            if row is None:
+                return
+            delay = self._backoff(int(row["attempts"]))
+            conn.execute(
+                """
+                UPDATE alarm_rounds
+                   SET state = 'verifying',
+                       needs_verify = 1,
+                       next_attempt_at = ?,
+                       last_error = ?,
+                       note = ?,
+                       updated_at = ?
+                 WHERE id = ? AND state IN ('delivering', 'verifying')
+                """,
+                (now + delay, error, note, now, round_id),
             )
 
     def _retry(
@@ -401,14 +462,7 @@ class AlarmService:
         *,
         needs_verify: bool,
         note_prefix: str,
-        definitive: bool = False,
     ) -> None:
-        if self._is_recovered(round_id) and definitive:
-            self._cancel(
-                round_id,
-                f"{note_prefix}；告警已恢复且通知未被受理，取消本轮的后续送达",
-            )
-            return
         now = self._clock()
         with self._db() as conn:
             row = conn.execute(
@@ -419,27 +473,82 @@ class AlarmService:
                 return
             delay = self._backoff(int(row["attempts"]))
             if row["recovered_at"] is not None:
+                # Recovery already happened while the delivery result is unconfirmed:
+                # the round can only be reconciled by number, never freshly notified.
+                state = "verifying"
                 note = (
-                    f"{note_prefix}；告警已恢复，但投递结果未知，先按通知号 "
+                    f"{note_prefix}；告警已恢复，原请求去向未确认，保持待核实，"
+                    f"按通知号 {row['notification_no']} 核实，不重复通知"
+                )
+            elif needs_verify:
+                state = "verifying"
+                note = (
+                    f"{note_prefix}；投递结果未确认，先按通知号 "
                     f"{row['notification_no']} 核实，不重复通知"
                 )
             else:
+                state = "pending"
                 note = f"{note_prefix}；将按通知号 {row['notification_no']} 重试"
             conn.execute(
                 """
                 UPDATE alarm_rounds
-                   SET state = 'pending',
-                       needs_verify = ?,
+                   SET state = ?,
+                       needs_verify = CASE WHEN ? = 'verifying' THEN 1 ELSE 0 END,
                        next_attempt_at = ?,
                        last_error = ?,
                        note = ?,
                        updated_at = ?
                  WHERE id = ? AND state = 'delivering'
                 """,
-                (1 if needs_verify else 0, now + delay, error, note, now, round_id),
+                (state, state, now + delay, error, note, now, round_id),
             )
 
     # ---------- delivery ----------
+
+    def _reconcile_recovered_close(self, round_id: int, notification_no: str) -> None:
+        """Close a recovered round only on a definitive notifier answer.
+
+        accepted  -> keep the delivery record (sent)
+        404/410   -> register a cancellation tombstone, then cancel locally
+        unknown   -> stay 待核实 and try again later; never guess
+        """
+        outcome = self._client.verify(notification_no)
+        if outcome.kind == "accepted":
+            self._mark_sent(
+                round_id,
+                outcome.accepted_at,
+                "恢复后按通知号核实：通知端已受理，保留送达记录",
+            )
+            return
+        if outcome.kind == "unknown":
+            self._set_verifying(
+                round_id,
+                outcome.detail or "核实结果未知",
+                f"通知端失联，原请求去向未确认，保持待核实并继续按通知号 {notification_no} 核实",
+            )
+            return
+        # Definitive absence (not_found) or an existing tombstone (cancelled):
+        # claim the number at the notifier so any in-flight late request is refused.
+        cancel_outcome = self._client.cancel(notification_no)
+        if cancel_outcome.kind == "accepted":
+            # The in-flight request landed between verify and cancel: it wins.
+            self._mark_sent(
+                round_id,
+                cancel_outcome.accepted_at,
+                "取消登记时发现通知端已受理迟到请求，保留送达记录",
+            )
+            return
+        if cancel_outcome.kind == "unknown":
+            self._set_verifying(
+                round_id,
+                cancel_outcome.detail or "取消登记失败",
+                f"通知端失联，无法确认取消登记，保持待核实并继续按通知号 {notification_no} 核实",
+            )
+            return
+        self._cancel(
+            round_id,
+            "告警已恢复；按通知号核实未受理且已在通知端登记取消，迟到请求不再受理该号",
+        )
 
     def _perform_delivery(self, row: dict[str, Any]) -> None:
         round_id = int(row["id"])
@@ -451,12 +560,13 @@ class AlarmService:
         now = self._clock()
         with self._lock, self._db() as conn:
             current = conn.execute(
-                "SELECT state, recovered_at, delivery_started_at FROM alarm_rounds WHERE id = ?",
+                "SELECT * FROM alarm_rounds WHERE id = ?",
                 (round_id,),
             ).fetchone()
             if current is None or current["state"] != "delivering":
                 return
-            if current["recovered_at"] is not None and not row["needs_verify"]:
+            # Use the freshly read flag, not the claimed snapshot.
+            if current["recovered_at"] is not None and not current["needs_verify"]:
                 # A fresh notify is a delivery that has not started: recovery cancels it.
                 self._cancel(round_id, "告警恢复时投递尚未开始，已取消送达")
                 return
@@ -473,34 +583,14 @@ class AlarmService:
                 """,
                 (now, now, now, round_id),
             )
+            # Re-read after the update: the claimed snapshot may hold stale values.
+            row = dict(
+                conn.execute("SELECT * FROM alarm_rounds WHERE id = ?", (round_id,)).fetchone()
+            )
 
         if row["needs_verify"]:
-            outcome = self._client.verify(notification_no)
-            if outcome.kind == "accepted":
-                self._mark_sent(
-                    round_id,
-                    outcome.accepted_at,
-                    "故障/重启后按通知号核实：通知端已受理，保留送达记录",
-                )
-                return
-            if outcome.kind == "unknown":
-                self._retry(
-                    round_id,
-                    outcome.detail or "核实结果未知",
-                    needs_verify=True,
-                    note_prefix="核实受理状态失败",
-                )
-                return
-            if self._is_recovered(round_id):
-                self._cancel(
-                    round_id,
-                    "告警已恢复，且按通知号核实通知端未受理；取消本轮送达",
-                )
-                return
-            with self._db() as conn:
-                conn.execute(
-                    "UPDATE alarm_rounds SET needs_verify = 0 WHERE id = ?", (round_id,)
-                )
+            self._reconcile_by_number(row)
+            return
 
         payload = {
             "notification_no": notification_no,
@@ -518,40 +608,130 @@ class AlarmService:
                 note = "通知端确认此前已按该通知号受理，未重复通知"
             self._mark_sent(round_id, outcome.accepted_at, note)
             return
-
-        # Any non-confirmation is resolved by notification number, never assumed sent.
-        verify = self._client.verify(notification_no)
-        if verify.kind == "accepted":
-            self._mark_sent(
-                round_id,
-                verify.accepted_at,
-                f"回执未确认（{outcome.detail or '无回执'}），按通知号核实已受理，保留记录",
-            )
-            return
-        if verify.kind == "unknown":
-            self._retry(
-                round_id,
-                f"回执未确认（{outcome.detail or '无回执'}）；{verify.detail or '核实结果未知'}",
-                needs_verify=True,
-                note_prefix="投递结果未确认",
-            )
-            return
-
-        if self._is_recovered(round_id):
+        if outcome.kind == "cancelled":
+            # The notifier already tombstones this number: closure is cancellation.
             self._cancel(
                 round_id,
-                f"回执未确认（{outcome.detail or '无回执'}），按通知号核实未受理；"
-                "告警已恢复，取消本轮送达",
+                "通知端已登记该通知号取消，迟到通知被拒绝，本轮结案为已取消",
+            )
+            return
+        if outcome.kind == "not_found":
+            # Definitive application-level rejection (e.g. 503): no request is in
+            # flight, so nothing can be accepted late. Recovered rounds close now;
+            # active ones back off and retry with the same fixed number.
+            if self._is_recovered(round_id):
+                self._cancel(
+                    round_id,
+                    f"通知端明确未受理（{outcome.detail or '拒绝'}）；告警已恢复，取消本轮送达",
+                )
+                return
+            self._retry(
+                round_id,
+                outcome.detail or "通知端未受理",
+                needs_verify=False,
+                note_prefix="通知端未受理",
             )
             return
 
-        # Definitively not accepted: bounded backoff, same notification number.
+        # outcome.kind == "unknown": the request may still be in flight (timeout,
+        # lost receipt). Reconcile immediately by the fixed notification number,
+        # never guess, never re-send blindly.
+        self._reconcile_by_number(row, notify_error=outcome.detail or "回执未确认")
+
+    def _reconcile_by_number(
+        self, row: dict[str, Any], *, notify_error: str | None = None
+    ) -> None:
+        """Reconcile a needs_verify round purely via its fixed notification number.
+
+        No fresh /notify is sent from here for recovered rounds; active rounds may
+        re-notify once the notifier definitively reports the number as absent.
+        """
+        round_id = int(row["id"])
+        notification_no = str(row["notification_no"])
+        outcome = self._client.verify(notification_no)
+
+        if outcome.kind == "accepted":
+            prefix = (
+                "恢复后按通知号核实"
+                if row["recovered_at"] is not None
+                else "按通知号核实"
+            )
+            self._mark_sent(
+                round_id,
+                outcome.accepted_at,
+                f"{prefix}：通知端已受理，保留送达记录",
+            )
+            return
+
+        if outcome.kind == "cancelled":
+            self._cancel(
+                round_id,
+                "按通知号核实：通知端已登记该号取消，本轮结案为已取消",
+            )
+            return
+
+        if outcome.kind == "unknown":
+            error = outcome.detail or "核实结果未知"
+            if notify_error:
+                error = f"回执未确认（{notify_error}）；{error}"
+            self._set_verifying(
+                round_id,
+                error,
+                f"通知端失联，原请求去向未确认，保持待核实并继续按通知号 {notification_no} 核实",
+            )
+            return
+
+        # outcome.kind == "not_found": the notifier definitively has no record.
+        if self._is_recovered(round_id):
+            self._reconcile_recovered_close(round_id, notification_no)
+            return
+
+        # Active round and the number is absent: safe to re-notify with the same
+        # fixed number. Re-read state first since recovery may have raced in.
+        with self._db() as conn:
+            fresh = conn.execute(
+                "SELECT * FROM alarm_rounds WHERE id = ?", (round_id,)
+            ).fetchone()
+            if fresh is None or fresh["state"] != "delivering":
+                return
+            if fresh["recovered_at"] is not None:
+                # Recovery just happened: never start a fresh notify for a closed round.
+                self._reconcile_recovered_close(round_id, notification_no)
+                return
+            conn.execute(
+                "UPDATE alarm_rounds SET needs_verify = 0 WHERE id = ?", (round_id,)
+            )
+            row = dict(fresh)
+            row["needs_verify"] = 0
+
+        payload = {
+            "notification_no": notification_no,
+            "device": DEVICE_NAME,
+            "round_id": round_id,
+            "triggered_at": row["triggered_at"],
+            "recovered_at": row["recovered_at"],
+            "maintenance_id": row["maintenance_id"],
+            "message": "供电柜过热告警",
+        }
+        notify_outcome = self._client.notify(payload)
+        if notify_outcome.kind == "accepted":
+            note = "通知端已受理"
+            if notify_outcome.duplicate:
+                note = "通知端确认此前已按该通知号受理，未重复通知"
+            self._mark_sent(round_id, notify_outcome.accepted_at, note)
+            return
+        if notify_outcome.kind == "cancelled":
+            self._cancel(
+                round_id,
+                "通知端已登记该通知号取消，迟到通知被拒绝，本轮结案为已取消",
+            )
+            return
+        # Still unconfirmed: stay in 待核实 and reconcile again later.
         self._retry(
             round_id,
-            outcome.detail or "通知端未受理",
-            needs_verify=False,
-            note_prefix="通知端未受理",
-            definitive=True,
+            notify_outcome.detail or "通知端未确认受理",
+            needs_verify=True,
+            note_prefix="重发后投递结果仍未确认",
         )
 
     def tick(self) -> None:
@@ -739,21 +919,24 @@ class AlarmService:
                     state = "skipped"
                     note = "检修结束前恢复，不补送通知"
                 elif state == "delivering" and row["delivery_started_at"] is None:
-                    # Claimed but never sent: safe to cancel.
+                    # Claimed but never sent: no request can be in flight, safe to cancel.
                     state = "cancelled"
                     needs_verify = 0
                     note = "告警恢复时投递尚未开始，已取消送达"
                 elif state == "delivering":
                     # An attempt is already in flight: resolve by number, never re-send.
-                    state = "pending"
+                    state = "verifying"
                     needs_verify = 1
-                    note = "告警恢复时投递已开始，只按原通知号确认结果，不再新发通知"
+                    note = "告警恢复时投递已开始，原请求去向未确认，显示待核实；只按原通知号确认结果，不再新发通知"
                 elif state == "pending" and needs_verify:
-                    note = "告警恢复时已有投递尝试，仅按原通知号核实结果，不再新发通知"
+                    state = "verifying"
+                    note = "告警恢复时已有投递尝试，原请求去向未确认，显示待核实；仅按原通知号核实，不再新发通知"
                 elif state == "pending":
                     # Not started: cancellable.
                     state = "cancelled"
                     note = "告警恢复时投递尚未开始，已取消送达"
+                elif state == "verifying":
+                    note = "告警恢复；原请求去向未确认，继续待核实，按通知号核实前不判取消也不重发"
                 elif state == "sent":
                     note = "告警恢复；此前通知已受理，保留送达记录"
                 conn.execute(
@@ -764,7 +947,7 @@ class AlarmService:
                            needs_verify = ?,
                            next_attempt_at = CASE
                                WHEN ? = 'cancelled' THEN NULL
-                               WHEN ? = 'pending' THEN ?
+                               WHEN ? IN ('pending', 'verifying') THEN ?
                                ELSE next_attempt_at
                            END,
                            note = ?,
@@ -853,6 +1036,7 @@ class AlarmService:
             counts = {
                 "suppressed": 0,
                 "pending": 0,
+                "verifying": 0,
                 "sent": 0,
                 "skipped": 0,
                 "cancelled": 0,
